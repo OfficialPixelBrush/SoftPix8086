@@ -194,6 +194,10 @@ enum Opcode {
     RET_d16     = 0xC3,
     RET         = 0xC4,
     // 0xDX
+    _ROT_rm8_1  = 0xD0,
+    _ROT_rm16_1 = 0xD1,
+    _ROT_rm8_CL = 0xD2,
+    _ROT_rm16_CL= 0xD3,
     // 0xEX
     CALL_rel16  = 0xE8,
     JMP_rel16   = 0xE9,
@@ -203,9 +207,22 @@ enum Opcode {
     HLT         = 0xF4,
     CLI         = 0xFA,
     STI         = 0xFB,
+    CLD         = 0xFC,
+    STD         = 0xFD,
 };
 
 typedef enum Opcode Opcode;
+
+enum AluOperation {
+    ROL = 0b000,
+    ROR = 0b001,
+    RCL = 0b010,
+    RCR = 0b011,
+    SHL = 0b100,
+    SHR = 0b101,
+    // invalid on 8086
+    SAR = 0b111
+};
 
 // 1 Mebibyte, 1024 Kibibytes, 1048575 Bytes
 #define TOTAL_MEMORY_SIZE (1 << (16 + 4)) -1
@@ -225,24 +242,32 @@ struct CPU {
     void WriteFlag(Flag flag, bool value) {
         flags = (flags & ~(1 << flag)) | (value << flag);
     }
-    Address GetAddress(SegmentRegister& reg) {
-        Address addr = (uint32_t(reg) << 4) + uint32_t(ip);
-        //printf("0x%05X - (0x%04X:0x%04X)\n", addr & 0xFFFFF, reg & 0xFFFFF, ip & 0xFFFFF);
-        return addr;
-    }
-
-    uint8_t ReadByte() {
-        uint8_t val = memory[GetAddress(cs)];
-        ip++;
-        return val;
+    Address CalcAddress(SegmentRegister& reg) {
+        return (uint32_t(reg) << 4) + uint32_t(ip);
     }
 
     void WriteByte(uint8_t value, uint32_t address) {
         memory[address] = value;
     }
 
-    uint16_t ReadWord() {
-        return ((uint16_t)ReadByte() << 8 | (uint16_t)ReadByte());
+    uint8_t ReadByte(uint32_t address) {
+        return memory[address];
+    }
+
+    uint8_t ReadByteAndAdvance(SegmentRegister& reg) {
+        uint8_t val = ReadByte(CalcAddress(reg));
+        ip++;
+        return val;
+    }
+
+    uint16_t ReadWord(uint32_t address) {
+        return ((uint16_t)ReadByte(address) << 8 | (uint16_t)ReadByte(address+1));
+    }
+
+    uint16_t ReadWordAndAdvance(SegmentRegister& reg) {
+        uint16_t val = ((uint16_t)ReadByte(CalcAddress(reg)) << 8 | (uint16_t)ReadByte(CalcAddress(reg)+1));
+        ip+=2;
+        return val; 
     }
 
     void WriteWord(uint16_t value, uint32_t address) {
@@ -324,144 +349,236 @@ struct CPU {
         PrintFlags();
     }
 
+    bool InRange(uint8_t& value, uint8_t start, uint8_t end) {
+        return (value > start && value < end);
+    }
+
+    bool WithinRange(uint8_t& value, uint8_t start, uint8_t end) {
+        return (value >= start && value <= end);
+    }
+
+    void ConditionalJump(uint8_t& opcode) {
+        int8_t rel = (int8_t)ReadByteAndAdvance(cs);
+        switch (opcode & 0x4) {
+            case 0x0:
+                if (!ReadFlag(OF))
+                    return;
+            case 0x1:
+                if (ReadFlag(OF))
+                    return;
+            case 0x2:
+                return;
+            case 0x3:
+                return;
+            case 0x4:
+                if (!ReadFlag(ZF))
+                    return;
+            case 0x5:
+                if (ReadFlag(ZF))
+                    return;
+            case 0x6:
+                return;
+            case 0x7:
+                return;
+            case 0x8:
+                if (!ReadFlag(SF))
+                    return;
+            case 0x9:
+                if (ReadFlag(SF))
+                    return;
+            case 0xA:
+                if (!ReadFlag(PF))
+                    return;
+            case 0xB:
+                if (!ReadFlag(PF))
+                    return;
+            case 0xC:
+                return;
+            case 0xD:
+                return;
+            case 0xE:
+                return;
+            case 0xF:
+                return;
+        }
+        ip += rel;
+        return;
+    }
+
+    void PushRegister(uint16_t& reg) {
+        WriteWord(reg, sp);
+        sp -= 2;
+    }
+
+    void PopRegister(uint16_t& reg) {
+        reg = ReadWord(sp);
+        sp += 2;
+    }
+
+    void PushPop(uint8_t& opcode) {
+        switch ((opcode >> 4) & 0xF) {
+            case 0x0:
+                PushRegister(a.x);
+                return;
+            case 0x1:
+                PushRegister(c.x);
+                return;
+            case 0x2:
+                PushRegister(d.x);
+                return;
+            case 0x3:
+                PushRegister(b.x);
+                return;
+            case 0x4:
+                PushRegister(sp);
+                return;
+            case 0x5:
+                PushRegister(bp);
+                return;
+            case 0x6:
+                PushRegister(si);
+                return;
+            case 0x7:
+                PushRegister(di);
+                return;
+            case 0x8:
+                PopRegister(a.x);
+                return;
+            case 0x9:
+                PopRegister(c.x);
+                return;
+            case 0xA:
+                PopRegister(d.x);
+                return;
+            case 0xB:
+                PopRegister(b.x);
+                return;
+            case 0xC:
+                PopRegister(sp);
+                return;
+            case 0xD:
+                PopRegister(bp);
+                return;
+            case 0xE:
+                PopRegister(si);
+                return;
+            case 0xF:
+                PopRegister(di);
+                return;
+        }
+    }
+
+    void MovesBx(uint8_t& opcode) {
+        uint16_t value;
+        uint8_t part = (opcode & 0xF);
+        if (part <= 0x7) {
+            value = ReadByteAndAdvance(cs);
+        } else {
+            value = ReadWordAndAdvance(cs);
+        }
+        switch(part) {
+            case 0x0:
+                a.l = value & 0xFF;
+                return;
+            case 0x1:
+                c.l = value & 0xFF;
+                return;
+            case 0x2:
+                d.l = value & 0xFF;
+                return;
+            case 0x3:
+                b.l = value & 0xFF;
+                return;
+            case 0x4:
+                a.h = value & 0xFF;
+                return;
+            case 0x5:
+                c.h = value & 0xFF;
+                return;
+            case 0x6:
+                d.h = value & 0xFF;
+                return;
+            case 0x7:
+                b.h = value & 0xFF;
+                return;
+            case 0x8:
+                a.x = value;
+                return;
+            case 0x9:
+                c.x = value;
+                return;
+            case 0xA:
+                d.x = value;
+                return;
+            case 0xB:
+                b.x = value;
+                return;
+            case 0xC:
+                sp = value;
+                return;
+            case 0xD:
+                bp = value;
+                return;
+            case 0xE:
+                si = value;
+                return;
+            case 0xF:
+                di = value;
+                return;
+        }
+    }
+
+    bool HandleMisc(uint8_t& opcode) {
+        switch(opcode) {
+            case CLI:
+                WriteFlag(IF, false);
+                return true;
+            case STI:
+                WriteFlag(IF, true);
+                return true;
+            case CLD:
+                WriteFlag(DF, false);
+                return true;
+            case STD:
+                WriteFlag(DF, true);
+                return true;
+            case SAHF:
+                flags = (uint16_t)a.h;
+                return true;
+            case LAHF:
+                a.h = flags & 0xFF;
+                return true;
+        }
+        return false;
+    }
+
     int cycle = 0;
     bool Process() {
         printf("\nCycle #%d\n", cycle++);
-        uint8_t opcode = ReadByte() & 0xFF;
+        uint8_t opcode = ReadByteAndAdvance(cs) & 0xFF;
         printf("Opcode: 0x%02X ", opcode & 0xFF);
-        switch(opcode) {
-            case INC_AX:
-                a.x++;
-                break;
-            case INC_BX:
-                b.x++;
-                break;
-            case INC_CX:
-                b.x++;
-                break;
-            case INC_DX:
-                d.x++;
-                break;
-            case INC_SP:
-                sp++;
-                break;
-            case INC_BP:
-                bp++;
-                break;
-            case INC_SI:
-                si++;
-                break;
-            case INC_DI:
-                di++;
-                break;
-            case DEC_AX:
-                a.x--;
-                break;
-            case DEC_BX:
-                b.x--;
-                break;
-            case DEC_CX:
-                b.x--;
-                break;
-            case DEC_DX:
-                d.x--;
-                break;
-            case DEC_SP:
-                sp--;
-                break;
-            case DEC_BP:
-                bp--;
-                break;
-            case DEC_SI:
-                si--;
-                break;
-            case DEC_DI:
-                di--;
-                break;
-            case JMP_rel8:
-                printf("(JMP_rel8)");
-                ip = ip + (int8_t)ReadByte();
-                break;
-            case CLI:
-                printf("(CLI)");
-                // clear interrupt
-                break;
-            case SAHF:
-                printf("(SAHF)");
-                flags = a.h;
-                break;
-            case MOV_AH_d8:
-                printf("(MOV_AH_d8)");
-                a.h = ReadByte();
-                break;
-            case JC_rel8: {
-                printf("(JC_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (ReadFlag(CF))
-                    ip = ip + val;
-                break;
+
+        // Misc
+        if (!HandleMisc(opcode)) {
+            // Jumps
+
+            // Conditional jumps
+            if (WithinRange(opcode, 0x70, 0x7F)) {
+                ConditionalJump(opcode);
             }
-            case JNC_rel8: {
-                printf("(JNC_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (!ReadFlag(CF))
-                    ip = ip + val;
-                break;
+            // Load/Store/Move
+            if (WithinRange(opcode, 0xB0, 0xBF)) {
+                MovesBx(opcode);
             }
-            case JE_rel8: {
-                printf("(JE_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (ReadFlag(ZF))
-                    ip = ip + val;
-                break;
+            if (WithinRange(opcode, 0x50, 0x5F)) {
+                PushPop(opcode);
             }
-            case JNE_rel8: {
-                printf("(JNE_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (!ReadFlag(ZF))
-                    ip = ip + val;
-                break;
-            }
-            case JP_rel8: {
-                printf("(JP_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (ReadFlag(PF))
-                    ip = ip + val;
-                break;
-            }
-            case JNP_rel8: {
-                printf("(JNP_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (!ReadFlag(PF))
-                    ip = ip + val;
-                break;
-            }
-            case JS_rel8: {
-                printf("(JS_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (ReadFlag(SF))
-                    ip = ip + val;
-                break;
-            }
-            case JNS_rel8: {
-                printf("(JNS_rel8)");
-                int8_t val = (int8_t)ReadByte();
-                if (!ReadFlag(SF))
-                    ip = ip + val;
-                break;
-            }
-            case LAHF:
-                printf("(LAHF)");
-                a.h = flags & 0xFF;
-            case HLT:
-                printf("(HLT)");
-                while(1) {}
-                break;
-            case NOP:
-            default:
-                printf("(NOP)");
-                break;
+            // Strings
+            // Arithmetic/logical
+            // Groups
+            // Prefixes
         }
+
         printf("\n");
         PrintRegisters();
         sleep(1);
